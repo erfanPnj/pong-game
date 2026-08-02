@@ -1,6 +1,6 @@
 ; ==============================================================================
 ; PONG & BREAKOUT GAME IN 8086 ASSEMBLY (VGA MODE 13h)
-; Includes: Circular Ball, Randomized Blocks (Resilience 1-5), VSYNC Sync
+; Includes: Circular Ball, Randomized Blocks (Resilience 1-5), Fixed IMUL DX Bug
 ; ==============================================================================
 
 .MODEL SMALL
@@ -10,7 +10,7 @@
     ; --- Ball Properties ---
     BALL_X      DW 160       ; Ball X Center
     BALL_Y      DW 120       ; Ball Y Center
-    BALL_R      DW 4         ; Ball Radius (Circular Ball)
+    BALL_R      DW 5         ; Ball Radius (Circular Ball)
     BALL_DX     DW 2         ; X Velocity
     BALL_DY     DW -2        ; Y Velocity
     BALL_COLOR  DB 14        ; Yellow Color
@@ -48,18 +48,18 @@ MAIN PROC FAR
     MOV AX, 0013H
     INT 10H
 
-    ; Set ES register to VGA Memory Base Address (A000h)
-    MOV AX, 0A000H
-    MOV ES, AX
+    ; Set ES register to VGA Memory Base Address (A000h) safely
+    PUSH 0A000H
+    POP ES
 
     ; 2. Initialize Random Blocks (1 to 5 Resilience)
     CALL INIT_BLOCKS
 
 GAME_LOOP:
-    ; Synchronize with Monitor VSYNC to prevent flickering
-    CALL WAIT_VSYNC
+    ; Software delay for smooth gameplay in JS-DOS / VS Code
+    CALL DELAY
     
-    ; Clear screen buffer
+    ; Clear screen buffer to black
     CALL CLEAR_SCREEN
 
     ; Render Game Objects
@@ -100,7 +100,7 @@ CLEAR_SCREEN PROC NEAR
     PUSH DI
 
     XOR DI, DI           ; Start at offset 0
-    XOR AL, AL           ; Color 0 (Black)
+    XOR AX, AX           ; Color 0 (Black)
     MOV CX, 32000        ; 32000 words = 64000 bytes
     CLD
     REP STOSW            ; Clear memory rapidly using word stores
@@ -112,28 +112,18 @@ CLEAR_SCREEN PROC NEAR
 CLEAR_SCREEN ENDP
 
 ; ==============================================================================
-; PROCEDURE: WAIT_VSYNC
-; Waits for standard monitor vertical retrace (Port 0x03DA)
+; PROCEDURE: DELAY
+; Software delay compatible with js-dos / VS Code emulator
 ; ==============================================================================
-WAIT_VSYNC PROC NEAR
-    PUSH AX
-    PUSH DX
-    MOV DX, 03DAH
-
-WAIT_END:
-    IN AL, DX
-    TEST AL, 08H
-    JNZ WAIT_END
-
-WAIT_START:
-    IN AL, DX
-    TEST AL, 08H
-    JZ WAIT_START
-
-    POP DX
-    POP AX
+DELAY PROC NEAR
+    PUSH CX
+    MOV CX, 01500H       ; Adjust this value if game is too fast/slow
+DELAY_LOOP:
+    NOP
+    LOOP DELAY_LOOP
+    POP CX
     RET
-WAIT_VSYNC ENDP
+DELAY ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_PIXEL
@@ -141,7 +131,6 @@ WAIT_VSYNC ENDP
 ; Inputs: CX = X, DX = Y, AL = Color Code
 ; ==============================================================================
 DRAW_PIXEL PROC NEAR
-    PUSH AX
     PUSH BX
     PUSH DX
     PUSH DI
@@ -154,19 +143,16 @@ DRAW_PIXEL PROC NEAR
     ADD DI, BX         ; DI = Y * 320
     ADD DI, CX         ; DI = Y * 320 + X
 
-    POP AX             ; Restore AL (Color)
-    PUSH AX
-    STOSB              ; Write pixel color to VGA memory
+    STOSB              ; Write AL (Color) directly to ES:[DI]
 
     POP DI
     POP DX
     POP BX
-    POP AX
     RET
 DRAW_PIXEL ENDP
 
 ; ==============================================================================
-; PROCEDURE: DRAW_CIRCLE
+; PROCEDURE: DRAW_CIRCLE (Fixed IMUL DX clobbering bug by using SI/DI)
 ; Draws a circle based on quadratic condition: (X-X0)^2 + (Y-Y0)^2 <= R^2
 ; ==============================================================================
 DRAW_CIRCLE PROC NEAR
@@ -174,28 +160,29 @@ DRAW_CIRCLE PROC NEAR
     PUSH BX
     PUSH CX
     PUSH DX
+    PUSH SI
+    PUSH DI
 
-    MOV DX, BALL_Y
-    SUB DX, BALL_R       ; Y_start = BALL_Y - BALL_R
-    MOV BX, BALL_Y
-    ADD BX, BALL_R       ; Y_end   = BALL_Y + BALL_R
+    MOV SI, BALL_Y
+    SUB SI, BALL_R       ; SI = Y_start (Row counter protected from IMUL)
+    MOV DI, BALL_Y
+    ADD DI, BALL_R       ; DI = Y_end
 
 ROW_LOOP:
     MOV CX, BALL_X
-    SUB CX, BALL_R       ; X_start = BALL_X - BALL_R
-    PUSH BX              ; Save Y_end
+    SUB CX, BALL_R       ; CX = X_start
 
 COL_LOOP:
-    ; Calculate (X - BALL_X)^2
+    ; Calculate dx^2 = (CX - BALL_X)^2
     MOV AX, CX
     SUB AX, BALL_X
-    IMUL AX
-    MOV BX, AX
+    IMUL AX              ; DX:AX = AX*AX (DX cloberred safely)
+    MOV BX, AX           ; BX = dx^2
 
-    ; Calculate (Y - BALL_Y)^2
-    MOV AX, DX
+    ; Calculate dy^2 = (SI - BALL_Y)^2
+    MOV AX, SI
     SUB AX, BALL_Y
-    IMUL AX
+    IMUL AX              ; DX:AX = AX*AX (DX cloberred safely)
     ADD BX, AX           ; BX = dx^2 + dy^2
 
     ; Calculate R^2
@@ -204,9 +191,15 @@ COL_LOOP:
 
     CMP BX, AX
     JG SKIP_PIXEL
-    
+
+    ; Draw Pixel at (X=CX, Y=SI)
+    PUSH CX
+    PUSH DX
+    MOV DX, SI           ; DX = Y coordinate for DRAW_PIXEL
     MOV AL, BALL_COLOR
     CALL DRAW_PIXEL
+    POP DX
+    POP CX
 
 SKIP_PIXEL:
     INC CX
@@ -215,11 +208,12 @@ SKIP_PIXEL:
     CMP CX, AX
     JLE COL_LOOP
 
-    POP BX               ; Restore Y_end
-    INC DX
-    CMP DX, BX
+    INC SI
+    CMP SI, DI
     JLE ROW_LOOP
 
+    POP DI
+    POP SI
     POP DX
     POP CX
     POP BX
@@ -241,23 +235,23 @@ DRAW_PADDLE PROC NEAR
     MOV BX, PADDLE_Y
     ADD BX, PADDLE_H
 
-PADDLE_ROW:
+PADDLE_Y_LOOP:
     MOV CX, PADDLE_X
     PUSH BX
     MOV BX, PADDLE_X
     ADD BX, PADDLE_W
 
-PADDLE_COL:
+PADDLE_X_LOOP:
     MOV AL, PADDLE_COL
     CALL DRAW_PIXEL
     INC CX
     CMP CX, BX
-    JL PADDLE_COL
+    JL PADDLE_X_LOOP
 
     POP BX
     INC DX
     CMP DX, BX
-    JL PADDLE_ROW
+    JL PADDLE_Y_LOOP
 
     POP DX
     POP CX
@@ -281,6 +275,8 @@ INIT_BLOCKS PROC NEAR
     XOR DI, DI
 
 INIT_LOOP:
+    PUSH CX              ; Save loop counter (INT 1Ah clobbers CX!)
+    
     ; Read System Timer Counter (INT 1Ah, AH = 00h)
     MOV AH, 00H
     INT 1AH              ; Returns clock ticks in CX:DX
@@ -292,6 +288,8 @@ INIT_LOOP:
     INC DX               ; DX = value between 1 and 5
 
     MOV BLOCKS[DI], DL   ; Assign resilience level
+    
+    POP CX               ; Restore loop counter safely
     INC DI
     LOOP INIT_LOOP
 
@@ -302,6 +300,36 @@ INIT_LOOP:
     POP AX
     RET
 INIT_BLOCKS ENDP
+
+; ==============================================================================
+; PROCEDURE: GET_BLOCK_COORDS
+; Calculates screen X, Y coordinates for block at Col = BX, Row = SI
+; Outputs: CX = Left X, DX = Top Y
+; ==============================================================================
+GET_BLOCK_COORDS PROC NEAR
+    PUSH AX
+
+    ; Calculate X: CX = (BX * (BLOCK_W + BLOCK_GAP)) + START_X
+    MOV AX, BX
+    MOV CX, BLOCK_W
+    ADD CX, BLOCK_GAP
+    IMUL CX
+    ADD AX, START_X
+    MOV CX, AX           ; CX = Top-Left X
+
+    ; Calculate Y: DX = (SI * (BLOCK_H + BLOCK_GAP)) + START_Y
+    MOV AX, SI
+    PUSH CX
+    MOV CX, BLOCK_H
+    ADD CX, BLOCK_GAP
+    IMUL CX
+    ADD AX, START_Y
+    MOV DX, AX           ; DX = Top-Left Y
+    POP CX
+
+    POP AX
+    RET
+GET_BLOCK_COORDS ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_BLOCKS
@@ -328,30 +356,7 @@ COL_BLOCK_LOOP:
 
     ; Map resilience level (1-5) to distinctive VGA colors
     ADD AL, 32           ; Color palette shift for visibility
-
-    ; Calculate top-left pixel X for current block
-    PUSH AX
-    MOV AX, BX
-    MOV CX, BLOCK_W
-    ADD CX, BLOCK_GAP
-    IMUL CX
-    ADD AX, START_X
-    MOV CX, AX           ; CX = Top-Left X
-    POP AX
-
-    ; Calculate top-left pixel Y for current block
-    PUSH AX
-    MOV AX, SI
-    PUSH CX
-    MOV CX, BLOCK_H
-    ADD CX, BLOCK_GAP
-    IMUL CX
-    ADD AX, START_Y
-    MOV DX, AX           ; DX = Top-Left Y
-    POP CX
-    POP AX
-
-    ; Draw single solid block
+    CALL GET_BLOCK_COORDS ; Returns CX = X, DX = Y
     CALL DRAW_SINGLE_BLOCK
 
 NEXT_BLOCK:
@@ -542,9 +547,8 @@ CHECK_GAME_OVER:
     MOV GAME_OVER, 1         ; Trigger Game Over if missed paddle
     JMP DONE_PHYSICS
 
-    ; 5. Block Collisions
+    ; 5. Block Collisions (Optimized with helper subroutine)
 CHECK_BLOCKS_COLLISION:
-    ; Check if ball Y is within the block cluster area
     MOV AX, START_Y
     CMP BALL_Y, AX
     JL DONE_PHYSICS
@@ -553,7 +557,6 @@ CHECK_BLOCKS_COLLISION:
     CMP BALL_Y, AX
     JG DONE_PHYSICS
 
-    ; Find which block index was hit by bounding approximation
     XOR DI, DI               ; Iterate all 32 blocks
     MOV SI, 0                ; Row index (0 to 3)
 
@@ -564,15 +567,7 @@ BCOL_LOOP:
     CMP BLOCKS[DI], 0
     JE NEXT_BCHECK
 
-    ; Calculate Block Left X -> CX
-    PUSH AX
-    MOV AX, BX
-    MOV CX, BLOCK_W
-    ADD CX, BLOCK_GAP
-    IMUL CX
-    ADD AX, START_X
-    MOV CX, AX
-    POP AX
+    CALL GET_BLOCK_COORDS    ; Returns CX = Left X, DX = Top Y
 
     ; Check X bounds: CX <= BALL_X <= CX + BLOCK_W
     CMP BALL_X, CX
@@ -580,18 +575,6 @@ BCOL_LOOP:
     ADD CX, BLOCK_W
     CMP BALL_X, CX
     JG NEXT_BCHECK
-
-    ; Calculate Block Top Y -> DX
-    PUSH AX
-    MOV AX, SI
-    PUSH CX
-    MOV CX, BLOCK_H
-    ADD CX, BLOCK_GAP
-    IMUL CX
-    ADD AX, START_Y
-    MOV DX, AX
-    POP CX
-    POP AX
 
     ; Check Y bounds: DX <= BALL_Y <= DX + BLOCK_H
     CMP BALL_Y, DX
@@ -610,11 +593,11 @@ NEXT_BCHECK:
     INC DI
     INC BX
     CMP BX, 8
-    JL BCOL_LOOP
+    JL BCOL_LOOP             ; Safe short jump distance
 
     INC SI
     CMP SI, 4
-    JL BROW_LOOP
+    JL BROW_LOOP             ; Safe short jump distance
 
 DONE_PHYSICS:
     POP DI
