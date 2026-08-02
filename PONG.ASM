@@ -1,6 +1,6 @@
 ; ==============================================================================
 ; PONG & BREAKOUT GAME IN 8086 ASSEMBLY (VGA MODE 13h)
-; Includes: Circular Ball, Randomized Blocks (Resilience 1-5), Fixed IMUL DX Bug
+; Includes: Circular Ball, Randomized Blocks (Resilience 1-5), Zero-Flicker Engine
 ; ==============================================================================
 
 .MODEL SMALL
@@ -54,20 +54,18 @@ MAIN PROC FAR
 
     ; 2. Initialize Random Blocks (1 to 5 Resilience)
     CALL INIT_BLOCKS
-
-GAME_LOOP:
-    ; Software delay for smooth gameplay in JS-DOS / VS Code
-    CALL DELAY
     
-    ; Clear screen buffer to black
+    ; 3. Initial Static Scene Rendering (Drawn ONCE to prevent CPU bottleneck)
     CALL CLEAR_SCREEN
-
-    ; Render Game Objects
     CALL DRAW_BLOCKS
     CALL DRAW_PADDLE
     CALL DRAW_CIRCLE
 
-    ; Input Handling & Physics Updates
+GAME_LOOP:
+    ; Frame timing delay
+    CALL DELAY
+
+    ; Only dynamic objects (Paddle & Ball) are updated when needed
     CALL CHECK_KEYBOARD
     CALL UPDATE_PHYSICS
 
@@ -92,7 +90,7 @@ MAIN ENDP
 
 ; ==============================================================================
 ; PROCEDURE: CLEAR_SCREEN
-; Clears all 64,000 bytes of video memory (A000:0000 to A000:FA00)
+; Clears all 64,000 bytes of video memory once at startup
 ; ==============================================================================
 CLEAR_SCREEN PROC NEAR
     PUSH AX
@@ -152,7 +150,7 @@ DRAW_PIXEL PROC NEAR
 DRAW_PIXEL ENDP
 
 ; ==============================================================================
-; PROCEDURE: DRAW_CIRCLE (Fixed IMUL DX clobbering bug by using SI/DI)
+; PROCEDURE: DRAW_CIRCLE
 ; Draws a circle based on quadratic condition: (X-X0)^2 + (Y-Y0)^2 <= R^2
 ; ==============================================================================
 DRAW_CIRCLE PROC NEAR
@@ -164,7 +162,7 @@ DRAW_CIRCLE PROC NEAR
     PUSH DI
 
     MOV SI, BALL_Y
-    SUB SI, BALL_R       ; SI = Y_start (Row counter protected from IMUL)
+    SUB SI, BALL_R       ; SI = Y_start
     MOV DI, BALL_Y
     ADD DI, BALL_R       ; DI = Y_end
 
@@ -176,18 +174,18 @@ COL_LOOP:
     ; Calculate dx^2 = (CX - BALL_X)^2
     MOV AX, CX
     SUB AX, BALL_X
-    IMUL AX              ; DX:AX = AX*AX (DX cloberred safely)
-    MOV BX, AX           ; BX = dx^2
+    IMUL AX
+    MOV BX, AX
 
     ; Calculate dy^2 = (SI - BALL_Y)^2
     MOV AX, SI
     SUB AX, BALL_Y
-    IMUL AX              ; DX:AX = AX*AX (DX cloberred safely)
-    ADD BX, AX           ; BX = dx^2 + dy^2
+    IMUL AX
+    ADD BX, AX
 
     ; Calculate R^2
     MOV AX, BALL_R
-    IMUL AX              ; AX = R^2
+    IMUL AX
 
     CMP BX, AX
     JG SKIP_PIXEL
@@ -195,7 +193,7 @@ COL_LOOP:
     ; Draw Pixel at (X=CX, Y=SI)
     PUSH CX
     PUSH DX
-    MOV DX, SI           ; DX = Y coordinate for DRAW_PIXEL
+    MOV DX, SI
     MOV AL, BALL_COLOR
     CALL DRAW_PIXEL
     POP DX
@@ -220,6 +218,22 @@ SKIP_PIXEL:
     POP AX
     RET
 DRAW_CIRCLE ENDP
+
+; ==============================================================================
+; PROCEDURE: ERASE_CIRCLE
+; Erases the ball by redrawing it in black (Color 0)
+; ==============================================================================
+ERASE_CIRCLE PROC NEAR
+    PUSH AX
+    MOV AL, BALL_COLOR
+    PUSH AX
+    MOV BALL_COLOR, 0    ; Set ball color to black temporarily
+    CALL DRAW_CIRCLE
+    POP AX
+    MOV BALL_COLOR, AL   ; Restore yellow color
+    POP AX
+    RET
+ERASE_CIRCLE ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_PADDLE
@@ -259,6 +273,22 @@ PADDLE_X_LOOP:
     POP AX
     RET
 DRAW_PADDLE ENDP
+
+; ==============================================================================
+; PROCEDURE: ERASE_PADDLE
+; Erases the paddle by redrawing it in black
+; ==============================================================================
+ERASE_PADDLE PROC NEAR
+    PUSH AX
+    MOV AL, PADDLE_COL
+    PUSH AX
+    MOV PADDLE_COL, 0    ; Set color to black
+    CALL DRAW_PADDLE
+    POP AX
+    MOV PADDLE_COL, AL   ; Restore green color
+    POP AX
+    RET
+ERASE_PADDLE ENDP
 
 ; ==============================================================================
 ; PROCEDURE: INIT_BLOCKS
@@ -454,23 +484,29 @@ CHECK_KEYBOARD PROC NEAR
     JMP KEY_DONE
 
 MOVE_LEFT:
+    CALL ERASE_PADDLE    ; Erase paddle before moving left
     MOV AX, PADDLE_STEP
     SUB PADDLE_X, AX
     CMP PADDLE_X, 2
-    JGE KEY_DONE
+    JGE DRAW_NEW_LEFT
     MOV PADDLE_X, 2
+DRAW_NEW_LEFT:
+    CALL DRAW_PADDLE     ; Immediately redraw paddle at new position
     JMP KEY_DONE
 
 MOVE_RIGHT:
+    CALL ERASE_PADDLE    ; Erase paddle before moving right
     MOV AX, PADDLE_STEP
     ADD PADDLE_X, AX
     MOV AX, PADDLE_X
     ADD AX, PADDLE_W
     CMP AX, 318
-    JLE KEY_DONE
+    JLE DRAW_NEW_RIGHT
     MOV AX, 318
     SUB AX, PADDLE_W
     MOV PADDLE_X, AX
+DRAW_NEW_RIGHT:
+    CALL DRAW_PADDLE     ; Immediately redraw paddle at new position
 
 KEY_DONE:
     POP DX
@@ -480,7 +516,7 @@ CHECK_KEYBOARD ENDP
 
 ; ==============================================================================
 ; PROCEDURE: UPDATE_PHYSICS
-; Updates coordinates and checks wall, paddle, and block collisions
+; Updates coordinates, checks collisions, and redraws ball dynamically
 ; ==============================================================================
 UPDATE_PHYSICS PROC NEAR
     PUSH AX
@@ -489,6 +525,9 @@ UPDATE_PHYSICS PROC NEAR
     PUSH DX
     PUSH SI
     PUSH DI
+
+    ; 0. Erase old ball position
+    CALL ERASE_CIRCLE
 
     ; 1. Update Ball Position
     MOV AX, BALL_DX
@@ -547,7 +586,7 @@ CHECK_GAME_OVER:
     MOV GAME_OVER, 1         ; Trigger Game Over if missed paddle
     JMP DONE_PHYSICS
 
-    ; 5. Block Collisions (Optimized with helper subroutine)
+    ; 5. Block Collisions
 CHECK_BLOCKS_COLLISION:
     MOV AX, START_Y
     CMP BALL_Y, AX
@@ -585,6 +624,27 @@ BCOL_LOOP:
 
     ; Collision Confirmed!
     DEC BLOCKS[DI]           ; Reduce resilience level by 1
+    
+    ; Update block visually based on remaining resilience
+    CMP BLOCKS[DI], 0
+    JE ERASE_DESTROYED_BLOCK
+    
+    ; If still alive, redraw block with new resilience color
+    PUSH AX
+    MOV AL, BLOCKS[DI]
+    ADD AL, 32
+    CALL DRAW_SINGLE_BLOCK
+    POP AX
+    JMP COLLISION_APPLIED
+
+ERASE_DESTROYED_BLOCK:
+    ; If destroyed (resilience = 0), erase it immediately with black color
+    PUSH AX
+    MOV AL, 0
+    CALL DRAW_SINGLE_BLOCK
+    POP AX
+
+COLLISION_APPLIED:
     NEG BALL_DY              ; Reflect vertical trajectory
     INC SCORE                ; Increment score towards win condition 30
     JMP DONE_PHYSICS
@@ -600,6 +660,9 @@ NEXT_BCHECK:
     JL BROW_LOOP             ; Safe short jump distance
 
 DONE_PHYSICS:
+    ; 6. Immediately redraw ball at new position with ZERO delay after erase!
+    CALL DRAW_CIRCLE
+
     POP DI
     POP SI
     POP DX
