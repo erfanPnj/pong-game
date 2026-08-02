@@ -1,12 +1,14 @@
 ; ==============================================================================
 ; PONG & BREAKOUT GAME IN 8086 ASSEMBLY (VGA MODE 13h)
-; Patched v3:
-;   - Score now increases only on paddle hits (not block hits)
-;   - Blocks are solid: real circle-vs-square collision (accounts for ball
-;     radius) with side detection, so the ball can no longer clip through
+; Patched v5 (Solid Paddle & Immediate Game-Over Fix):
+;   - Paddle is a solid object: ball is pushed safely above paddle surface
+;     on collision, preventing clipping or rapid score inflation
+;   - Immediate Game Over: if the bottom of the ball reaches PADDLE_Y without
+;     hitting the paddle, the player loses immediately
+;   - Visual 3px Cyan Arcade Arena Borders (Top, Left, Right)
+;   - Score now increases only on clean paddle hits
 ;   - Exactly one random layout of up to 6 square blocks, generated once at
-;     startup (no regeneration on contact); each block shows its 1-5
-;     resilience value as text
+;     startup; each block shows its 1-5 resilience value as text
 ; ==============================================================================
 
 .MODEL SMALL
@@ -104,6 +106,7 @@ MAIN PROC FAR
 
     ; 3. Initial Static Scene Rendering (Drawn ONCE to prevent CPU bottleneck)
     CALL CLEAR_SCREEN
+    CALL DRAW_WALLS
     CALL DRAW_BLOCKS
     CALL DRAW_PADDLE
     CALL DRAW_CIRCLE
@@ -402,6 +405,64 @@ ERASE_PADDLE PROC NEAR
 ERASE_PADDLE ENDP
 
 ; ==============================================================================
+; PROCEDURE: DRAW_WALLS (Visual Arcade Arena Borders)
+; Draws 3-pixel thick Cyan (Color 3) borders around top, left, and right edges.
+; ==============================================================================
+DRAW_WALLS PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    MOV AL, 3               ; Color 3 = Cyan (Classic Arcade Border)
+
+    ; --- 1. Top Wall (X = 0 to 319, Y = 10 to 12) below SCORE text ---
+    MOV DX, 10
+TOP_WALL_Y:
+    MOV CX, 0
+TOP_WALL_X:
+    CALL DRAW_PIXEL
+    INC CX
+    CMP CX, 320
+    JL TOP_WALL_X
+    INC DX
+    CMP DX, 13
+    JL TOP_WALL_Y
+
+    ; --- 2. Left Wall (X = 0 to 2, Y = 13 to 199) ---
+    MOV DX, 13
+LEFT_WALL_Y:
+    MOV CX, 0
+LEFT_WALL_X:
+    CALL DRAW_PIXEL
+    INC CX
+    CMP CX, 3
+    JL LEFT_WALL_X
+    INC DX
+    CMP DX, 200
+    JL LEFT_WALL_Y
+
+    ; --- 3. Right Wall (X = 317 to 319, Y = 13 to 199) ---
+    MOV DX, 13
+RIGHT_WALL_Y:
+    MOV CX, 317
+RIGHT_WALL_X:
+    CALL DRAW_PIXEL
+    INC CX
+    CMP CX, 320
+    JL RIGHT_WALL_X
+    INC DX
+    CMP DX, 200
+    JL RIGHT_WALL_Y
+
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+DRAW_WALLS ENDP
+
+; ==============================================================================
 ; PROCEDURE: DRAW_SCORE_LABEL (drawn once at startup only)
 ; ==============================================================================
 DRAW_SCORE_LABEL PROC NEAR
@@ -500,10 +561,6 @@ GET_RANDOM ENDP
 
 ; ==============================================================================
 ; PROCEDURE: INIT_BLOCKS
-; Runs ONCE at program start. Picks 3-6 unique grid slots (out of 36 possible,
-; via a partial Fisher-Yates draw so blocks never overlap), assigns each a
-; random 1-5 resilience value, and marks it active. Never called again, so
-; no new blocks ever appear mid-game.
 ; ==============================================================================
 INIT_BLOCKS PROC NEAR
     PUSH AX
@@ -513,12 +570,10 @@ INIT_BLOCKS PROC NEAR
     PUSH SI
     PUSH DI
 
-    ; Seed the generator once using the system timer tick count
     MOV AH, 00H
     INT 1AH
     MOV RAND_SEED, DX
 
-    ; Fill the slot pool with 0..GRID_TOTAL-1
     MOV CX, GRID_TOTAL
     MOV BX, 0
 FILL_POOL_LOOP:
@@ -529,7 +584,6 @@ FILL_POOL_LOOP:
 
     MOV REMAINING, GRID_TOTAL
 
-    ; Decide how many blocks to place this game: 3 to 6 (never more than 6)
     CALL GET_RANDOM
     XOR DX, DX
     MOV BX, 4
@@ -537,7 +591,7 @@ FILL_POOL_LOOP:
     ADD DL, 3
     MOV NUM_BLOCKS, DL
 
-    XOR SI, SI                 ; SI = block slot index (0..NUM_BLOCKS-1)
+    XOR SI, SI
 PLACE_BLOCK_LOOP:
     MOV AL, NUM_BLOCKS
     MOV AH, 0
@@ -546,16 +600,14 @@ PLACE_BLOCK_LOOP:
     JMP PLACE_BLOCKS_DONE
 PLACE_BLOCK_BODY:
 
-    ; pick a random remaining pool position and read the grid slot it holds
     CALL GET_RANDOM
     XOR DX, DX
     MOV BX, REMAINING
     DIV BX
-    MOV BX, DX                 ; BX = chosen pool position
-    MOV AL, SLOT_POOL[BX]      ; AL = chosen grid slot number (0-35)
-    MOV DL, AL                 ; keep it safe in DL
+    MOV BX, DX
+    MOV AL, SLOT_POOL[BX]
+    MOV DL, AL
 
-    ; remove it from the pool: move the last pool element into its place
     MOV AX, REMAINING
     DEC AX
     MOV DI, AX
@@ -563,30 +615,26 @@ PLACE_BLOCK_BODY:
     MOV SLOT_POOL[BX], CL
     DEC REMAINING
 
-    ; convert grid slot number (in DL) into row, col
     MOV AH, 0
     MOV AL, DL
     XOR DX, DX
     MOV BX, GRID_COLS
-    DIV BX                      ; AX = row, DX = col
+    DIV BX
 
-    ; pixel Y = GRID_START_Y + row*CELL_SIZE
     MOV BX, CELL_SIZE
-    PUSH DX                     ; save col
+    PUSH DX
     MUL BX
     ADD AX, GRID_START_Y
     MOV DI, SI
-    SHL DI, 1                   ; DI = SI*2 (word index)
+    SHL DI, 1
     MOV BLOCK_Y[DI], AX
 
-    ; pixel X = GRID_START_X + col*CELL_SIZE
-    POP AX                      ; AX = col
+    POP AX
     MOV BX, CELL_SIZE
     MUL BX
     ADD AX, GRID_START_X
     MOV BLOCK_X[DI], AX
 
-    ; random resilience 1-5, mark active
     CALL GET_RANDOM
     XOR DX, DX
     MOV BX, 5
@@ -599,8 +647,6 @@ PLACE_BLOCK_BODY:
     JMP PLACE_BLOCK_LOOP
 
 PLACE_BLOCKS_DONE:
-    ; any slots from NUM_BLOCKS..5 stay at their .DATA default (0 = inactive)
-
     POP DI
     POP SI
     POP DX
@@ -611,7 +657,7 @@ PLACE_BLOCKS_DONE:
 INIT_BLOCKS ENDP
 
 ; ==============================================================================
-; PROCEDURE: GET_RESILIENCE_COLOR (Maps Resilience 1-5 to Distinct Palette)
+; PROCEDURE: GET_RESILIENCE_COLOR
 ; ==============================================================================
 GET_RESILIENCE_COLOR PROC NEAR
     CMP AL, 5
@@ -622,25 +668,24 @@ GET_RESILIENCE_COLOR PROC NEAR
     JE COL_3
     CMP AL, 2
     JE COL_2
-    MOV AL, 48           ; Resilience 1 = Blue
+    MOV AL, 48
     RET
 COL_2:
-    MOV AL, 46           ; Resilience 2 = Green
+    MOV AL, 46
     RET
 COL_3:
-    MOV AL, 44           ; Resilience 3 = Yellow
+    MOV AL, 44
     RET
 COL_4:
-    MOV AL, 42           ; Resilience 4 = Orange
+    MOV AL, 42
     RET
 COL_5:
-    MOV AL, 40           ; Resilience 5 = Red
+    MOV AL, 40
     RET
 GET_RESILIENCE_COLOR ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_BLOCKS
-; Draws the (up to 6) active square blocks with their color + number.
 ; ==============================================================================
 DRAW_BLOCKS PROC NEAR
     PUSH AX
@@ -685,8 +730,6 @@ DRAW_BLOCKS ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_SINGLE_BLOCK
-; Draws a solid BLOCK_SIZE x BLOCK_SIZE square.
-; Inputs: CX = X, DX = Y, AL = Color
 ; ==============================================================================
 DRAW_SINGLE_BLOCK PROC NEAR
     PUSH BX
@@ -724,10 +767,6 @@ DRAW_SINGLE_BLOCK ENDP
 
 ; ==============================================================================
 ; PROCEDURE: DRAW_BLOCK_NUMBER
-; Writes the resilience value (1-5) on top of a block using BIOS teletype.
-; Grid constants are all multiples of 8, so this aligns exactly to the
-; blocks top-left pixel - no rounding drift.
-; Inputs: AL = resilience (1-5), CX = block X (pixel), DX = block Y (pixel)
 ; ==============================================================================
 DRAW_BLOCK_NUMBER PROC NEAR
     PUSH AX
@@ -739,7 +778,7 @@ DRAW_BLOCK_NUMBER PROC NEAR
     ADD AL, '0'
     MOV BLOCK_NUM_CHAR, AL
 
-    MOV SI, DX                 ; preserve block Y before DX is used by DIV
+    MOV SI, DX
 
     MOV AX, CX
     XOR DX, DX
@@ -801,9 +840,9 @@ MOVE_LEFT:
     CALL ERASE_PADDLE
     MOV AX, PADDLE_STEP
     SUB PADDLE_X, AX
-    CMP PADDLE_X, 2
+    CMP PADDLE_X, 4
     JGE DRAW_NEW_LEFT
-    MOV PADDLE_X, 2
+    MOV PADDLE_X, 4
 DRAW_NEW_LEFT:
     CALL DRAW_PADDLE
     JMP KEY_DONE
@@ -814,9 +853,9 @@ MOVE_RIGHT:
     ADD PADDLE_X, AX
     MOV AX, PADDLE_X
     ADD AX, PADDLE_W
-    CMP AX, 318
+    CMP AX, 315
     JLE DRAW_NEW_RIGHT
-    MOV AX, 318
+    MOV AX, 315
     SUB AX, PADDLE_W
     MOV PADDLE_X, AX
 DRAW_NEW_RIGHT:
@@ -830,10 +869,9 @@ CHECK_KEYBOARD ENDP
 
 ; ==============================================================================
 ; PROCEDURE: UPDATE_PHYSICS
-; Score increases ONLY when the ball bounces off the paddle (Issue #1).
-; Blocks are solid: real circle-vs-square overlap test using BALL_R, with
-; side detection so the ball bounces off whichever face it hit (Issue #2).
-; Blocks are only ever the set created once in INIT_BLOCKS (Issue #3).
+; Patched v5:
+;   - Paddle acts as a solid surface (ball is pushed to Y = PADDLE_Y - BALL_R - 1)
+;   - Immediate Game Over if ball reaches PADDLE_Y without hitting paddle
 ; ==============================================================================
 UPDATE_PHYSICS PROC NEAR
     PUSH AX
@@ -852,11 +890,12 @@ UPDATE_PHYSICS PROC NEAR
     MOV AX, BALL_DY
     ADD BALL_Y, AX
 
-    ; 2. Wall Collisions (Left / Right)
+    ; 2. Wall Collisions (Left / Right) - Patched for 3px Visual Walls
     MOV AX, BALL_R
+    ADD AX, 3
     CMP BALL_X, AX
     JLE REV_DX
-    MOV AX, 320
+    MOV AX, 316
     SUB AX, BALL_R
     CMP BALL_X, AX
     JGE REV_DX
@@ -866,9 +905,10 @@ REV_DX:
     NEG BALL_DX
     JMP CHECK_TOP
 
-    ; 3. Top Wall Collision
+    ; 3. Top Wall Collision - Patched for Top Wall at Y=10..12
 CHECK_TOP:
     MOV AX, BALL_R
+    ADD AX, 13
     CMP BALL_Y, AX
     JLE REV_DY_TOP
     JMP CHECK_PADDLE_COLLISION
@@ -877,35 +917,45 @@ REV_DY_TOP:
     NEG BALL_DY
     JMP CHECK_BLOCKS_COLLISION
 
-    ; 4. Paddle Collision (Bottom) - the ONLY place SCORE increases
+    ; 4. Paddle Collision (Bottom) - Solid Top Bounce OR Immediate Game Over
 CHECK_PADDLE_COLLISION:
     MOV AX, PADDLE_Y
     SUB AX, BALL_R
     CMP BALL_Y, AX
-    JGE PADDLE_Y_IN_RANGE
+    JGE PADDLE_Y_REACHED           ; If bottom of ball reached paddle top surface
     JMP CHECK_BLOCKS_COLLISION
-PADDLE_Y_IN_RANGE:
+
+PADDLE_Y_REACHED:
+    ; Only trigger paddle check when the ball is falling downwards
+    CMP BALL_DY, 0
+    JLE CHECK_GAME_OVER_IMMEDIATE
+
+    ; Check horizontal overlap with fair radius tolerance
+    MOV AX, PADDLE_X
+    SUB AX, BALL_R                 ; Left limit: PADDLE_X - BALL_R
+    CMP BALL_X, AX
+    JL CHECK_GAME_OVER_IMMEDIATE
 
     MOV AX, PADDLE_X
-    CMP BALL_X, AX
-    JGE PADDLE_X_CHECK_2
-    JMP CHECK_GAME_OVER
-PADDLE_X_CHECK_2:
     ADD AX, PADDLE_W
+    ADD AX, BALL_R                 ; Right limit: PADDLE_X + PADDLE_W + BALL_R
     CMP BALL_X, AX
-    JLE PADDLE_HIT_CONFIRMED
-    JMP CHECK_GAME_OVER
-PADDLE_HIT_CONFIRMED:
+    JG CHECK_GAME_OVER_IMMEDIATE
 
-    NEG BALL_DY
+PADDLE_HIT_CONFIRMED:
+    ; Solid bounce: push ball safely above paddle surface so it NEVER clips or eats!
+    MOV AX, PADDLE_Y
+    SUB AX, BALL_R
+    DEC AX
+    MOV BALL_Y, AX                 ; BALL_Y = PADDLE_Y - BALL_R - 1
+
+    NEG BALL_DY                    ; Reflect vertically upwards
     INC SCORE
     CALL DRAW_SCORE_VALUE
     JMP CHECK_BLOCKS_COLLISION
 
-CHECK_GAME_OVER:
-    MOV AX, 198
-    CMP BALL_Y, AX
-    JL CHECK_BLOCKS_COLLISION
+CHECK_GAME_OVER_IMMEDIATE:
+    ; If bottom of ball reached paddle level without a clean bounce -> LOSE IMMEDIATELY
     MOV GAME_OVER, 1
     JMP DONE_PHYSICS
 
