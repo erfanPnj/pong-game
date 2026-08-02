@@ -11,8 +11,8 @@
     BALL_X      DW 160       ; Ball X Center
     BALL_Y      DW 120       ; Ball Y Center
     BALL_R      DW 5         ; Ball Radius (Circular Ball)
-    BALL_DX     DW 2         ; X Velocity
-    BALL_DY     DW -2        ; Y Velocity
+    BALL_DX     DW 1         ; X Velocity
+    BALL_DY     DW -1        ; Y Velocity
     BALL_COLOR  DB 14        ; Yellow Color
 
     ; --- Paddle Properties ---
@@ -110,16 +110,24 @@ CLEAR_SCREEN PROC NEAR
 CLEAR_SCREEN ENDP
 
 ; ==============================================================================
-; PROCEDURE: DELAY
-; Software delay compatible with js-dos / VS Code emulator
+; PROCEDURE: DELAY (Nested Loop for Accurate Arcade Speed)
 ; ==============================================================================
 DELAY PROC NEAR
+    PUSH BX
     PUSH CX
-    MOV CX, 01500H       ; Adjust this value if game is too fast/slow
-DELAY_LOOP:
+
+    MOV BX, 1            ; <-- تنظیم سرعت بازی (عدد بزرگ‌تر = بازی کندتر)
+OUTER_DELAY:
+    MOV CX, 0E000H       ; تعداد تکرار حلقه داخلی
+INNER_DELAY:
     NOP
-    LOOP DELAY_LOOP
+    LOOP INNER_DELAY
+    
+    DEC BX
+    JNZ OUTER_DELAY
+
     POP CX
+    POP BX
     RET
 DELAY ENDP
 
