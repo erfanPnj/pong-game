@@ -1,14 +1,12 @@
 ; ==============================================================================
 ; PONG & BREAKOUT GAME IN 8086 ASSEMBLY (VGA MODE 13h)
-; Patched v5 (Solid Paddle & Immediate Game-Over Fix):
-;   - Paddle is a solid object: ball is pushed safely above paddle surface
-;     on collision, preventing clipping or rapid score inflation
-;   - Immediate Game Over: if the bottom of the ball reaches PADDLE_Y without
-;     hitting the paddle, the player loses immediately
+; Patched v6 (Hardware UART Integration - Proteus STM32 & LCD Ready):
+;   - COM1 (03F8h) initialized at 9600 Baud (8N1)
+;   - Reads 'L' / 'R' from STM32 Controller to move paddle (with PC keyboard fallback)
+;   - Transmits 'S' + Score Byte (0..30) on paddle hit to update LCD
+;   - Transmits 'W' (Win) or 'G' (Game Over) on game termination
 ;   - Visual 3px Cyan Arcade Arena Borders (Top, Left, Right)
-;   - Score now increases only on clean paddle hits
-;   - Exactly one random layout of up to 6 square blocks, generated once at
-;     startup; each block shows its 1-5 resilience value as text
+;   - Solid Paddle & Ball physics synchronized to wall inner boundaries
 ; ==============================================================================
 
 .MODEL SMALL
@@ -101,10 +99,13 @@ MAIN PROC FAR
     PUSH 0A000H
     POP ES
 
-    ; 2. Initialize the (at most 6) random square blocks - done ONCE
+    ; 2. Initialize Hardware Serial Port COM1 (03F8h) @ 9600 Baud
+    CALL INIT_SERIAL
+
+    ; 3. Initialize the (at most 6) random square blocks - done ONCE
     CALL INIT_BLOCKS
 
-    ; 3. Initial Static Scene Rendering (Drawn ONCE to prevent CPU bottleneck)
+    ; 4. Initial Static Scene Rendering (Drawn ONCE to prevent CPU bottleneck)
     CALL CLEAR_SCREEN
     CALL DRAW_WALLS
     CALL DRAW_BLOCKS
@@ -130,6 +131,10 @@ GAME_LOOP:
     JMP GAME_LOOP
 
 EXIT_GAME:
+    ; --- Transmit 'G' (Game Over) command to STM32 LCD ---
+    MOV AL, 'G'
+    CALL SERIAL_SEND_BYTE
+
     MOV SI, OFFSET GAME_OVER_MSG
     MOV CX, GAME_OVER_MSG_LEN
     MOV DH, 12
@@ -141,6 +146,10 @@ EXIT_GAME:
 
 WIN_GAME:
     MOV WIN_FLAG, 1
+    ; --- Transmit 'W' (Win) command to STM32 LCD ---
+    MOV AL, 'W'
+    CALL SERIAL_SEND_BYTE
+
     MOV SI, OFFSET WIN_MSG
     MOV CX, WIN_MSG_LEN
     MOV DH, 12
@@ -808,12 +817,91 @@ DRAW_BLOCK_NUMBER PROC NEAR
 DRAW_BLOCK_NUMBER ENDP
 
 ; ==============================================================================
-; PROCEDURE: CHECK_KEYBOARD
+; PROCEDURE: INIT_SERIAL
+; Initializes COM1 (03F8h) at 9600 Baud, 8 Data bits, No Parity, 1 Stop bit
+; ==============================================================================
+INIT_SERIAL PROC NEAR
+    PUSH AX
+    PUSH DX
+
+    ; Using BIOS INT 14h, AH=00h
+    ; AL = 11100011b (0E3h) -> 111 (9600 baud) | 00 (No parity) | 0 (1 stop) | 11 (8-bit)
+    MOV AH, 00H
+    MOV AL, 0E3H
+    XOR DX, DX          ; DX = 0 -> COM1 (03F8h)
+    INT 14H
+
+    POP DX
+    POP AX
+    RET
+INIT_SERIAL ENDP
+
+; ==============================================================================
+; PROCEDURE: SERIAL_SEND_BYTE
+; Transmits byte in AL over COM1 non-blocking
+; ==============================================================================
+SERIAL_SEND_BYTE PROC NEAR
+    PUSH AX
+    PUSH DX
+    MOV AH, AL          ; Save byte to send in AH
+
+    MOV DX, 03FDH       ; Line Status Register (3FDh)
+WAIT_TX:
+    IN AL, DX
+    TEST AL, 20H
+    JZ WAIT_TX          ; Wait until Transmitter Holding Register is empty
+
+    MOV DX, 03F8H       ; COM1 Data Register
+    MOV AL, AH
+    OUT DX, AL          ; Transmit byte to STM32!
+
+    POP DX
+    POP AX
+    RET
+SERIAL_SEND_BYTE ENDP
+
+; ==============================================================================
+; PROCEDURE: SERIAL_READ_BYTE
+; Checks if data is available on COM1.
+; Returns: ZF=1 if no data, ZF=0 and AL=byte if received.
+; ==============================================================================
+SERIAL_READ_BYTE PROC NEAR
+    PUSH DX
+    MOV DX, 03FDH       ; Line Status Register
+    IN AL, DX
+    TEST AL, 01H        ; Bit 0 = Data Ready
+    JZ NO_SERIAL_DATA
+
+    MOV DX, 03F8H       ; COM1 Data Register
+    IN AL, DX           ; Read received ASCII char into AL
+    OR AL, AL           ; Clear ZF (data is present)
+    JMP READ_DONE
+
+NO_SERIAL_DATA:
+    XOR AL, AL          ; Set ZF=1 (No data available)
+
+READ_DONE:
+    POP DX
+    RET
+SERIAL_READ_BYTE ENDP
+
+; ==============================================================================
+; PROCEDURE: CHECK_KEYBOARD (Patched: Dual Input - STM32 UART & PC Keyboard)
 ; ==============================================================================
 CHECK_KEYBOARD PROC NEAR
     PUSH AX
     PUSH DX
 
+    ; --- 1. Check Hardware UART (STM32 Controller) First ---
+    CALL SERIAL_READ_BYTE
+    JZ CHECK_LOCAL_KEYBOARD  ; If no UART byte, check local keyboard
+    
+    CMP AL, 'L'              ; Left button pressed on STM32
+    JE MOVE_LEFT
+    CMP AL, 'R'              ; Right button pressed on STM32
+    JE MOVE_RIGHT
+
+CHECK_LOCAL_KEYBOARD:
     MOV AH, 01H
     INT 16H
     JZ KEY_DONE
@@ -840,7 +928,7 @@ MOVE_LEFT:
     CALL ERASE_PADDLE
     MOV AX, PADDLE_STEP
     SUB PADDLE_X, AX
-    CMP PADDLE_X, 4
+    CMP PADDLE_X, 4          ; Keep away from Left Wall (0..2)
     JGE DRAW_NEW_LEFT
     MOV PADDLE_X, 4
 DRAW_NEW_LEFT:
@@ -853,7 +941,7 @@ MOVE_RIGHT:
     ADD PADDLE_X, AX
     MOV AX, PADDLE_X
     ADD AX, PADDLE_W
-    CMP AX, 315
+    CMP AX, 315              ; Keep away from Right Wall (317..319)
     JLE DRAW_NEW_RIGHT
     MOV AX, 315
     SUB AX, PADDLE_W
@@ -869,9 +957,8 @@ CHECK_KEYBOARD ENDP
 
 ; ==============================================================================
 ; PROCEDURE: UPDATE_PHYSICS
-; Patched v5:
-;   - Paddle acts as a solid surface (ball is pushed to Y = PADDLE_Y - BALL_R - 1)
-;   - Immediate Game Over if ball reaches PADDLE_Y without hitting paddle
+; Patched v6:
+;   - Transmits 'S' + Score Byte to STM32 on paddle hits to update LCD
 ; ==============================================================================
 UPDATE_PHYSICS PROC NEAR
     PUSH AX
@@ -922,40 +1009,44 @@ CHECK_PADDLE_COLLISION:
     MOV AX, PADDLE_Y
     SUB AX, BALL_R
     CMP BALL_Y, AX
-    JGE PADDLE_Y_REACHED           ; If bottom of ball reached paddle top surface
+    JGE PADDLE_Y_REACHED
     JMP CHECK_BLOCKS_COLLISION
 
 PADDLE_Y_REACHED:
-    ; Only trigger paddle check when the ball is falling downwards
     CMP BALL_DY, 0
     JLE CHECK_GAME_OVER_IMMEDIATE
 
-    ; Check horizontal overlap with fair radius tolerance
     MOV AX, PADDLE_X
-    SUB AX, BALL_R                 ; Left limit: PADDLE_X - BALL_R
+    SUB AX, BALL_R
     CMP BALL_X, AX
     JL CHECK_GAME_OVER_IMMEDIATE
 
     MOV AX, PADDLE_X
     ADD AX, PADDLE_W
-    ADD AX, BALL_R                 ; Right limit: PADDLE_X + PADDLE_W + BALL_R
+    ADD AX, BALL_R
     CMP BALL_X, AX
     JG CHECK_GAME_OVER_IMMEDIATE
 
 PADDLE_HIT_CONFIRMED:
-    ; Solid bounce: push ball safely above paddle surface so it NEVER clips or eats!
     MOV AX, PADDLE_Y
     SUB AX, BALL_R
     DEC AX
-    MOV BALL_Y, AX                 ; BALL_Y = PADDLE_Y - BALL_R - 1
+    MOV BALL_Y, AX
 
-    NEG BALL_DY                    ; Reflect vertically upwards
+    NEG BALL_DY
     INC SCORE
     CALL DRAW_SCORE_VALUE
+
+    ; --- Transmit Score Update ('S' followed by raw score byte) to STM32 ---
+    MOV AL, 'S'
+    CALL SERIAL_SEND_BYTE
+    MOV AX, SCORE
+    CALL SERIAL_SEND_BYTE
+    ; -----------------------------------------------------------------------
+
     JMP CHECK_BLOCKS_COLLISION
 
 CHECK_GAME_OVER_IMMEDIATE:
-    ; If bottom of ball reached paddle level without a clean bounce -> LOSE IMMEDIATELY
     MOV GAME_OVER, 1
     JMP DONE_PHYSICS
 
@@ -974,7 +1065,7 @@ BLOCKS_Y_TOP_OK:
     JMP DONE_PHYSICS
 BLOCKS_Y_BOTTOM_OK:
 
-    XOR SI, SI                     ; SI = block index 0..5
+    XOR SI, SI
 BLOCK_CHECK_LOOP:
     CMP SI, BLOCK_COUNT_MAX
     JL BLOCK_CHECK_CONTINUE
@@ -988,10 +1079,9 @@ BLOCK_IS_ACTIVE:
 
     MOV DI, SI
     SHL DI, 1
-    MOV CX, BLOCK_X[DI]            ; CX = block left X
-    MOV DX, BLOCK_Y[DI]            ; DX = block top Y
+    MOV CX, BLOCK_X[DI]
+    MOV DX, BLOCK_Y[DI]
 
-    ; --- Expanded AABB (circle-vs-square) overlap test ---
     MOV AX, BALL_X
     ADD AX, BALL_R
     CMP AX, CX
@@ -1024,7 +1114,6 @@ NO_COLLISION_HERE:
     JMP NEXT_BLOCK_CHECK
 
 COLLISION_CONFIRMED:
-    ; --- Compute penetration depth from each of the 4 sides ---
     MOV AX, BALL_X
     ADD AX, BALL_R
     SUB AX, CX
@@ -1047,7 +1136,6 @@ COLLISION_CONFIRMED:
     ADD AX, BALL_R
     MOV OVERLAP_B, AX
 
-    ; --- Smallest penetration = the side actually hit ---
     MOV AX, OVERLAP_L
     MOV BX, 0
     CMP OVERLAP_R, AX
